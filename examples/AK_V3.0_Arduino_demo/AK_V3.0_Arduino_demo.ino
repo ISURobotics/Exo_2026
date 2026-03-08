@@ -323,12 +323,12 @@ void setup() {
     // pinMode(5, INPUT);
     // pinMode(6, INPUT);
     // pinMode(7, INPUT);
-    Serial.begin(115200);
+    Serial.begin(1000000);
     Serial.print("\r\nrun...\r\n");
 
     if (mcp2515.reset() == MCP2515::ERROR_OK) {
         Serial.print("CAN init ok!\r\n");
-        mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
+        mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
         mcp2515.setNormalMode();
 
         comm_can_transmit_eid(0x00, can_test, 8);

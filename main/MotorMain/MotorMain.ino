@@ -1,476 +1,289 @@
-/*
-CamRo
-Cameron Coward cameroncoward.com
-Serial Hobbyism serialhobbyism.com
+// demo: CAN -BUS Shield, send data
+// loovee@seeed.cc https://www.youtube.com/watch?v=UWc_7-8gXeE
 
-Works with both Arduino Uno R4 Minima and Arduino Uno R4 WiFi
-(solder the corresponding bridge on the shield)
-*/
+#include <mcp_can.h>
+#include <SPI.h>
 
-#include <FastLED.h>
-#include <Arduino_CAN.h>
-#include <arduino-timer.h>
+/* SAMD core*/
+#ifdef ARDUINO_SAMD_VARIANT_COMPLIANCE
+  #define SERIAL SerialUSB
+#else
+  #define SERIAL 0x00
+#endif
 
-#define START_BUTTON    6       // Start button pin on Arduino
-#define HOME_BUTTON     7       // Home button pin on Arduino
-#define ARM_ANGLE_POT   A5      // Pin for arm angle potentiometer
-#define ARM_SPEED_POT   A4      // Pin for arm speed potentiometer
-#define TABLE_SPEED_POT A3      // Pin for table speed potentiometer
-#define NEOPIXEL_PIN    2       // Digital IO pin connected to the NeoPixels.
-#define PIXEL_COUNT     1       // Number of NeoPixels
-#define ACCEL           5000    // acceleration value to use for shoulder, elbow, and table movements
-#define POS_TOL         0.25    // how close (in degrees, plus or minus) the reported position needs to be to the desired position to consider it "reached"
-#define HOM_SPD         1000    // this is the speed at which the arm motor moves when homing
-#define HOM_CUR_THRESH  4.0     // if arm motor draws more current than this, it is hitting stop and that is home
-#define HOM_BACK        8.0     // how many degrees the arm moves back after touching the stop
-#define BRAKE_CUR       4.0     // how much current to use when braking arm motor
+//Define Joystick connection pins
+#define UP A1
+#define DOWN A3
+#define RIGHT A5
+#define CLICK A4
+#define LEFT A2
 
-CRGB leds[PIXEL_COUNT];                 // for the status LED
+//Define LED pins
+#define LED2 8
+#define LED3 7
 
-auto timer = timer_create_default();    // to update motors at regular intervals
+//VALUE LIMIS
 
-// store button states
-bool startButtonStateOld = HIGH;
-bool startButtonState = HIGH;
-bool homeButtonStateOld = HIGH;
-bool homeButtonState = HIGH;
+#define P_MIN -12.5f
+#define P_MAX 12.5f
+#define V_MIN -30.0f
+#define V_MAX 30.0f
+#define T_MIN -18.0f
+#define T_MAX 18.0f
+#define KP_MIN 0.0f
+#define KP_MAX 500.0f
+#define KD_MIN 0.0f
+#define KD_MAX 5.0f
 
-// has the arm been homed?
-bool homed = false;
+// SET VALUES
 
-// motor IDsset these in the CubeMars tool! Will not work unless these match!
-const int armMotorID = 106;
-const int tableMotorID = 107;
+float p_in = 0.0f;
+float v_in = 3.0f;
+float kp_in = 0.0f;
+float kd_in = 3.0f;
+float t_in = 0.0f;
+//measured values
 
-// for motor updates when moving
-int motorToUpdate = 0;
-int armAngle = 0;
-int armSpeed = 0;
-int tableSpeed = 0;
+float p_out = 0.0f;
+float v_out = 0.0f;
+float t_out = 0.0f;
 
-// values received from Arm motor via CAN updates
-float reportedArmPos = 0.1;
-float reportedArmSpd = 0.1;
-float reportedArmCur = 0.1;
-int reportedArmTmp = 1;
-int reportedArmErr = 1;
+//the cs pin of the version after v1.1 is default to D9
+//v0.9 and v1.0 is default D10
+const int SPI_CS_PIN = 10;
 
-// values received from Table motor via CAN updates
-float reportedTablePos = 1.0;
-float reportedTableSpd = 1.0;
-float reportedTableCur = 1.0;
-int reportedTableTmp = 1;
-int reportedTableErr = 1;
+const unsigned long MOTOR_ID = 0x68;
 
-// required for motor control
-enum AKMode {
-  AK_PWM = 0,
-  AK_CURRENT,
-  AK_CURRENT_BRAKE,
-  AK_VELOCITY,
-  AK_POSITION,
-  AK_ORIGIN,
-  AK_POSITION_VELOCITY,
-};
+MCP_CAN CAN (SPI_CS_PIN);   //Set CS pin
 
 void setup() {
-  Serial.begin(115200);
-  FastLED.addLeds<NEOPIXEL, NEOPIXEL_PIN>(leds, PIXEL_COUNT);
-  pinMode(START_BUTTON, INPUT_PULLUP);
-  pinMode(HOME_BUTTON, INPUT_PULLUP);
-  leds[0] = CRGB::Red;
-  FastLED.show();
-  if (!CAN.begin(CanBitRate::BR_1000k))
+  Serial.begin(500000);
+  delay(1000);
+  while (CAN_OK != CAN.begin(MCP_ANY,CAN_500KBPS, MCP_16MHZ))
   {
-
+    Serial.println("CAN BUS Shield init fail");
+    Serial.println(" Init CAN BUS Shield again");
+    delay(100);
   }
-  Serial.println("CAN initialized.");
-  home(); // get ready to home arm after startup
+Serial.println("CAN BUS Shield is ok!");
+
+//Intialize pins as necessary
+
+pinMode(UP, INPUT);
+pinMode(DOWN, INPUT);
+pinMode(LEFT, INPUT);
+pinMode(RIGHT, INPUT);
+pinMode(CLICK, INPUT);
+pinMode(LED2, OUTPUT);
+pinMode(LED3, OUTPUT);
+
+//Pull analog pins high to enable reading of joystick movements
+digitalWrite(UP, HIGH);
+digitalWrite(DOWN, HIGH);
+digitalWrite(LEFT, HIGH);
+digitalWrite(RIGHT, HIGH);
+digitalWrite(CLICK, HIGH);
+
+//Write LED pins low to trun them off by default
+
+digitalWrite(LED2, LOW);
+digitalWrite(LED3, LOW);
+
 }
+
+long previousMillis = 0;
 
 void loop() {
-  timer.tick();   // advance the timer
+  static bool started = false;
 
-  // check for CAN messages. If they exist, process them.
-  if (CAN.available()) {
-    processCAN();
+  if (!started) {
+    EnterMotorMode();
+    delay(10);
+    Zero();              // optional but helpful
+    delay(1000);
+     kp_in = 200.0f;
+    kd_in = 3.0f;
+    v_in  = 0.0f;
+    t_in  = 0.0f;
+    p_in  = 6.283185f;      // one full revolution = 2*pi radians
+
+    started = true;
   }
+         // target position
+  pack_cmd();
 
-  // can start movement if arm is homed.
-  if (homed == true) {
-    startButtonState = digitalRead(START_BUTTON);
-    if (startButtonState == LOW) {
-      startButtonStateOld = LOW;
-      run();
-    }
-  }
-}
-
-void home(){
-
-  // check for button press
-  while (homeButtonState == HIGH) {
-    homeButtonState = digitalRead(HOME_BUTTON);
-  }
-
-  // make status LED yellow to indicate homing
-  leds[0] = CRGB::Orange;
-  FastLED.show();
-
-  // check CAN to clear buffer
-  if (CAN.available()) {
-    processCAN();
-  }
-
-  Serial.println("Homing.");
-
-  // begin moving arm until motor current exceeds threshold, indicating it has hit the stop
-  while (reportedArmCur < HOM_CUR_THRESH) {
-    comm_can_set_rpm(armMotorID, HOM_SPD);
-
-    if (CAN.available()) {
-      processCAN();
-    }
-  }
-
-  Serial.println("Found home.");
-
-  // set arm arngle back slightly, so it isn't pushed up against the stop
-  armAngle = reportedArmPos - HOM_BACK;
-
-  // factor in tolerance in reported position
-  float armAngleDiff = abs(reportedArmPos - armAngle);
-
-  // move arm to new postion until it falls within that tolerance
-  while (armAngleDiff > POS_TOL) {
-    if (CAN.available()) {
-      processCAN();
-    }
-
-    comm_can_set_pos_spd(armMotorID, armAngle, HOM_SPD, ACCEL);
-
-    armAngleDiff = abs(reportedArmPos - armAngle);
-
-    if (armAngleDiff < POS_TOL) {
-      break;
-    }
-  }
-
-  if (CAN.available()) {
-      processCAN();
-  }
-
-  delay(5);
-
-  // set origin at current angles and change desired angles to 0 to prevent movment
-
-  comm_can_set_origin(armMotorID, 0);
-  armAngle = 0.0;
-  armSpeed = 0.0;
-  tableSpeed = 0.0;
-
-  if (CAN.available()) {
-      processCAN();
-  }
-  
-  delay (5);
-
-  comm_can_set_origin(tableMotorID, 0);
-
-  // update motors so they don't try to move to old set positions
-  if (CAN.available()) {
-      processCAN();
-  }
-
-  Serial.print("Arm position: ");
-  Serial.println(reportedArmPos);
-  Serial.print("Table position: ");
-  Serial.println(reportedTablePos);
-
-  // set status LED to green to indicate readiness
-  leds[0] = CRGB::Green;
-  FastLED.show();
-  homed = true;
-
-  // begin updating motors every 20 milliseconds
-  timer.every(20, updateMotors);
-}
-
-void run(){
-
-  // not in home position after this
-  homed = false;
-
-  leds[0] = CRGB::Blue;
-  FastLED.show();
-
-  // check to see how to move motors
-  armAngle = analogRead(ARM_ANGLE_POT);
-  armSpeed = analogRead(ARM_SPEED_POT);
-  tableSpeed = analogRead(TABLE_SPEED_POT);
-  
-  // map potentiometer inputs to valid ranges
-  armAngle = map(armAngle, 0, 1023, 0, -173);
-  armSpeed = map(armSpeed, 0, 1023, 0, 3000);
-  tableSpeed = map(tableSpeed, 0, 1023, 1000, -1000);
-
-  // see if current position is close to the desired position
-  float armAngleDiff = abs(reportedArmPos - armAngle);
-
-  // if that is further than the specified tolerance
-  while (armAngleDiff > POS_TOL) {
-    timer.tick();
-
-    if (CAN.available()) {
-      processCAN();
-    }
-
-    armAngleDiff = abs(reportedArmPos - armAngle);
-
-    if (armAngleDiff < POS_TOL) {
-      break;
-    }
-
-    // user can push start button again to prematurely end the movement
-    startButtonState = digitalRead(START_BUTTON);
-    if (startButtonState == LOW && startButtonStateOld == HIGH) {
-      startButtonStateOld = LOW;
-      break;
-    }
-    startButtonStateOld = startButtonState;
-  }
-
-  armAngle = 0;
-
-  armAngleDiff = abs(reportedArmPos - armAngle);
-
-  while (armAngleDiff > POS_TOL) {
-    timer.tick();
-
-    if (CAN.available()) {
-      processCAN();
-    }
-
-    armAngleDiff = abs(reportedArmPos - armAngle);
-
-    if (armAngleDiff < POS_TOL) {
-      break;
-    }
-  }
-
-  armSpeed = 0;
-  tableSpeed = 0;
-
-  leds[0] = CRGB::Green;
-  FastLED.show();  
-
-  homed = true;
-}
-
-bool updateMotors(void *){
-
-  // each time the timer triggers this function, update one of the motors (but not the other). This prevents overloading the CAN bus.
-  switch (motorToUpdate){
-    case 0:
-      updateArm();
-      break;
-    case 1:
-      updateTable();
-      break;
-    default:
-      break;
-  }
-
-  motorToUpdate = motorToUpdate + 1;
-  if (motorToUpdate > 1){motorToUpdate = 0;}
-}
-
-void updateArm(){
-  // move the arm motor
-  comm_can_set_pos_spd(armMotorID, armAngle, armSpeed, ACCEL);
-}
-
-void updateTable(){
-  // move the table motor
-  comm_can_set_rpm(tableMotorID, tableSpeed);
-}
-
-// ||||||||||||-----------CAN Bus Functions-----------||||||||||||
-
-void processCAN() {
-  // looks at all messages on the CAN bus and parses/stores the relevant info from each motor
-
-  CanMsg const msg = CAN.read();
-
-  /* CAN ID reporting is very weird.
-
-    it is the motor ID in Hex (like 6A), but with a '1' in front (like 16A)
-    and THAT value is then converted to decimal (like 362)
-
-    that's because it is sending hex address bytes as Little Endian: 6A-01
-    or Big Endian: 01-6A
-
-    so, we just want the relevant byte (6A) and to ignore th other (01)
-
-    like this:
-
-    byte motor_id = lowByte(msg.getStandardId());
-  
-    Serial.print("ID: ");
-    Serial.print(lowByte(motor_id), HEX);
-
-  */
-
-  byte motor_id = lowByte(msg.getStandardId());
-  int16_t pos_int = msg.data[0] << 8 | msg.data[1];
-  int16_t spd_int = msg.data[2] << 8 | msg.data[3];
-  int16_t cur_int = msg.data[4] << 8 | msg.data[5];
-  
-  if (motor_id == byte(armMotorID)) {
-    reportedArmPos = (float)(pos_int * 0.1f);
-    reportedArmSpd = (float)(spd_int * 10.0f);
-    reportedArmCur = (float)(cur_int * 0.01f);
-    reportedArmTmp = msg.data[6];
-    reportedArmErr = msg.data[7];
-  } else if (motor_id == byte(tableMotorID)) {
-    reportedTablePos = (float)(pos_int * 0.1f);
-    reportedTableSpd = (float)(spd_int * 10.0f);
-    reportedTableCur = (float)(cur_int * 0.01f);
-    reportedTableTmp = msg.data[6];
-    reportedTableErr = msg.data[7];
+  if (CAN_MSGAVAIL == CAN.checkReceive()) {
+    unpack_reply();
+    Serial.print("p_out: ");
+    Serial.print(p_out);
+    Serial.print("  v_out: ");
+    Serial.print(v_out);
+    Serial.print("  t_out: ");
+    Serial.println(t_out);
   } else {
+    Serial.println("No reply");
   }
+
+  delay(20);
 }
+void unpack_reply() {
+/// CAB reply Oacjet structure///
+/// 16 bit position, between -4*pi and 4*pi
+/// 12 bit velocity, between -30 and +30 rad/s
+/// 12 bit current, between -40 and 40;
+/// CAN Packet is 5 8-bit words
+///Formatted as follows. For each quantity, bit 0 is LSB
+/// 0: [position [15-8]]
+/// 1: [position[7-0]]
+/// 2: [velocity [11-4]]
+/// 3: [velocity [3-0], current [11-8]]
+/// 4: [current [7-0]]
 
-// ||||||||||||-----------CubeMars Motor Functions-----------||||||||||||
-
-/*
-
-Motors:
-
-Shoulder: 105 (69 in hex)
-Elbow: 106 (6A in hex)
-Wrist: 107 (6B in hex)
-
-Address them by hex, like this:
-
-comm_can_set_origin(0x69, 0);
-
-Or this:
-
-comm_can_set_pos_spd(0x6C, 1800000, 20000, 30000);
-
-The position value is of type int32, and the range is -360,000,000-360,000,000, representing
--36000-36000.
-
-So position is as follows:
-
-Number of degrees, up to 100 turns in either direction.
-
-That, multiplied by 10,000.0, which should yield a number suitable to convert to a 32-bit integer
-
-*/
-
-uint32_t canId(int id, AKMode Mode_set) {
-  uint32_t mode;
-  mode = Mode_set;
-  return uint32_t(id | mode << 8);
-}
-
-void comm_can_transmit_eid(uint32_t id, const uint8_t* data, uint8_t len) {
-  uint8_t i = 0;
-  if (len > 8) {
-    len = 8;
-  }
-  uint8_t buf[len];
-  for (i = 0; i < len; i++) {
-    buf[i] = data[i];
-  }
-  //CAN.sendMsgBuf(id, 1, len, buf); //Note that data frame is extended so I did write "1" in here
-  CanMsg const msg(CanExtendedId(id), len, buf);
-  CAN.write(msg);
-
-}
-
-void buffer_append_int32(uint8_t* buffer, int32_t number, int32_t* index) {
-  buffer[(*index)++] = number >> 24;
-  buffer[(*index)++] = number >> 16;
-  buffer[(*index)++] = number >> 8;
-  buffer[(*index)++] = number;
-}
-
-void buffer_append_int16(uint8_t* buffer, int16_t number, int16_t* index) {
-  buffer[(*index)++] = number >> 8;
-  buffer[(*index)++] = number;
-}
-
-
-void comm_can_set_duty(uint8_t controller_id, float duty) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  buffer_append_int32(buffer, (int32_t)(duty * 100000.0), &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_PWM), buffer, send_index);
-}
-
-void comm_can_set_current(uint8_t controller_id, float current) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  buffer_append_int32(buffer, (int32_t)(current * 1000.0), &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_CURRENT), buffer, send_index);
-}
-
-void comm_can_set_cb(uint8_t controller_id, float current) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  buffer_append_int32(buffer, (int32_t)(current * 1000.0), &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_CURRENT_BRAKE), buffer, send_index);
-}
-
-void comm_can_set_rpm(uint8_t controller_id, float rpm) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  buffer_append_int32(buffer, (int32_t)rpm, &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_VELOCITY), buffer, send_index);
-}
-
-void comm_can_set_pos(uint8_t controller_id, float pos) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  int32_t setPosition = pos * 10000;
-  buffer_append_int32(buffer, setPosition, &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_POSITION), buffer, send_index);
-}
-
-void comm_can_set_pos_spd(uint8_t controller_id, float pos, int16_t spd, int16_t RPA) {
-  int32_t send_index = 0;
-  int16_t send_index1 = 4;
-  uint8_t buffer[8];
-  int32_t setPosition = pos * 10000;
-  buffer_append_int32(buffer, setPosition, &send_index);
-  buffer_append_int16(buffer, spd/10.0, &send_index1);
-  buffer_append_int16(buffer, RPA/10.0, &send_index1);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_POSITION_VELOCITY), buffer, send_index1);
-}
-
-void comm_can_set_origin(uint8_t controller_id, uint8_t set_origin_mode) {
-  int32_t send_index = 0;
-  uint8_t buffer[4];
-  buffer_append_int32(buffer, (int32_t)set_origin_mode, &send_index);
-  comm_can_transmit_eid(canId(controller_id, AKMode::AK_ORIGIN), buffer, send_index);
-}
-
-void motor_receive(float* motor_pos, float* motor_spd, float* motor_cur, int8_t* motor_temp, int8_t* motor_error, uint8_t* rx_message) {
   byte len = 0;
   byte buf[8];
   unsigned long canId;
 
-  //CAN.read(&len, buf);
-  int16_t pos_int = buf[0] << 8 | buf[1];
-  int16_t spd_int = buf[2] << 8 | buf[3];
-  int16_t cur_int = buf[4] << 8 | buf[5];
-  *motor_pos = (float)(pos_int * 0.1f);
-  *motor_spd = (float)(spd_int * 10.0f);
-  *motor_cur = (float)(cur_int * 0.01f);
-  *motor_temp = buf[6];
-  *motor_error = buf[7];
+  CAN.readMsgBuf(&canId, &len, buf); 
+
+  Serial.print("ID: ");
+  Serial.print(canId, HEX);
+  Serial.print("  RAW: ");
+  for (int i = 0; i < len; i++) {
+    if (buf[i] < 16) Serial.print("0");
+    Serial.print(buf[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+  //read data
+  //MCP_CAN::readMsgBuf(*len,  buf[])
+
+  
+  /// unpack ints from CAN buffer ///
+  unsigned int id = buf[0];
+  unsigned int p_int = (buf[1] << 8) | buf[2];
+  unsigned int v_int = (buf[3] << 4) | (buf[4] >> 4);
+  unsigned int i_int = ((buf[4] & 0xF) << 8) | buf[5];
+  /// convert uints to floats ///
+  p_out = uint_to_float(p_int, P_MIN, P_MAX, 16);
+  v_out = uint_to_float(v_int, V_MIN, V_MAX, 12);
+  t_out = uint_to_float(i_int, -T_MAX, T_MAX, 12);
+}
+void EnterMotorMode(){
+  //Enter Motor Mode(enable)
+  byte buf[8];
+  buf[0] = 0xFF;
+  buf[1] = 0xFF;
+  buf[2] = 0xFF;
+  buf[3] = 0xFF;
+  buf[4] = 0xFF;
+  buf[5] = 0xFF;
+  buf[6] = 0xFF;
+  buf[7] = 0xFC;
+  CAN.sendMsgBuf(MOTOR_ID,0, 8, buf);
+}
+void ExitMotorMode(){
+  byte buf[8];
+  buf[0] = 0xFF;
+  buf[1] = 0xFF;
+  buf[2] = 0xFF;
+  buf[3] = 0xFF;
+  buf[4] = 0xFF;
+  buf[5] = 0xFF;
+  buf[6] = 0xFF;
+  buf[7] = 0xFD;
+  CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
+}
+void Zero(){
+  //Enter Motor Mode(enable)
+  byte buf[8];
+  buf[0] = 0xFF;
+  buf[1] = 0xFF;
+  buf[2] = 0xFF;
+  buf[3] = 0xFF;
+  buf[4] = 0xFF;
+  buf[5] = 0xFF;
+  buf[6] = 0xFF;
+  buf[7] = 0xFE;
+  CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
+
+}
+void pack_cmd(){
+  byte buf[8];
+  ///CAN Command Packet Structure///
+  ///16 bit position command, between -4*pi and 4*pi
+  ///12 bit velocity command, between -30 and +30rad/s
+  //12 bit kp, between 0 and 500 N-m/rad
+  ///12 bit kd, between 0 and 100 N-m*s/rad
+  /// 12 bit feed forward toque, between -18 and 18 N-m
+  ///CAN packet is 8 8-bit words
+  ///Formatted as follows. For each quantity, bit i0 is LSB
+  /// 0: [position[15-8[[
+  ///1: [position [7-0]]
+  ///2: [velocity[11-4]]
+  ///3: [velocity[3-0], kp[11-8]]
+  ///4: [kp[7-0]]
+  ///5: [kd[11-4]]
+  ///6:[kd[3-0], torque [11-8]]
+  ///7: [torque [7-0]]
+
+  ///limit data to be withing bounds///
+
+  float p_des = constrain(p_in, P_MIN, P_MAX); ///fminf(fmaxf(P_MIN, p_in(, P_MAX);
+  float v_des = constrain(v_in, V_MIN, V_MAX); ///fminf(fmaxf(V_MIN, v_in(, V_MAX);
+  float kp = constrain(kp_in, KP_MIN, KP_MAX); ///fminf(fmaxf(KP_MIN, kp_in(, KP_MAX);
+  float kd = constrain(kd_in, KD_MIN, KD_MAX); ///fminf(fmaxf(KD_MIN, kd_in(, KD_MAX);
+  float t_ff = constrain(t_in, T_MIN, T_MAX); ///fminf(fmaxf(T_MIN, t_in(, V_MAX);
+
+ ///convert floats to unsigned ints///
+  unsigned int p_int = float_to_uint(p_des, P_MIN, P_MAX, 16);
+  unsigned int v_int = float_to_uint(v_des, V_MIN, V_MAX, 12);
+  unsigned int kp_int = float_to_uint(kp, KP_MIN, KP_MAX, 12);
+  unsigned int kd_int = float_to_uint(kd, KD_MIN, KD_MAX, 12);
+  unsigned int t_int = float_to_uint(t_ff, T_MIN, T_MAX, 12);
+
+/// pack ints into the can buffer///
+
+  buf[0] = p_int >> 8;
+  buf[1] = p_int & 0xFF;;
+  buf[2] = v_int >> 4;
+  buf[3] = ((v_int & 0xF) <<4) | (kp_int >>8);
+  buf[4] = kp_int & 0xFF;
+  buf[5] = kd_int >>4;
+  buf[6] = ((kd_int & 0xF) <<4) | (t_int >>8);
+  buf[7] = t_int & 0xFF;
+  byte s = CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
+  Serial.print("send=");
+  Serial.println(s);
+}
+
+
+unsigned int float_to_uint(float x, float x_min, float x_max, int bits)
+{
+  ///Converts a  float to an unsigned int, given range and number of bits///
+  float span = x_max-x_min;
+  float offset = x_min;
+  unsigned int pgg = 0;
+  if(bits==12){
+    pgg = (unsigned int) ((x-offset)*4095.0/span);
+  }
+  if(bits==16){
+    pgg = (unsigned int) ((x-offset)*65535.0/span);
+  }
+  return pgg;
+}
+
+float uint_to_float(unsigned int x_int, float x_min, float x_max, int bits)
+{
+  ///converts unsigned int to float, given range and number of bits///
+  float span = x_max-x_min;
+  float offset = x_min;
+  float pgg = 0;
+  if (bits==12){
+    pgg = ((float) x_int)*span/4095 + offset;
+  }
+  if (bits==16){
+    pgg = ((float) x_int)*span/65535.0 + offset;
+  }
+  return pgg;
+
 }
