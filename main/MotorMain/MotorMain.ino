@@ -1,289 +1,61 @@
-// demo: CAN -BUS Shield, send data
-// loovee@seeed.cc https://www.youtube.com/watch?v=UWc_7-8gXeE
-
 #include <mcp_can.h>
 #include <SPI.h>
 
-/* SAMD core*/
-#ifdef ARDUINO_SAMD_VARIANT_COMPLIANCE
-  #define SERIAL SerialUSB
-#else
-  #define SERIAL 0x00
-#endif
+const int SPI_CS_PIN = 10;   // try 9 too if needed
+MCP_CAN CAN(SPI_CS_PIN);
 
-//Define Joystick connection pins
-#define UP A1
-#define DOWN A3
-#define RIGHT A5
-#define CLICK A4
-#define LEFT A2
-
-//Define LED pins
-#define LED2 8
-#define LED3 7
-
-//VALUE LIMIS
-
-#define P_MIN -12.5f
-#define P_MAX 12.5f
-#define V_MIN -30.0f
-#define V_MAX 30.0f
-#define T_MIN -18.0f
-#define T_MAX 18.0f
-#define KP_MIN 0.0f
-#define KP_MAX 500.0f
-#define KD_MIN 0.0f
-#define KD_MAX 5.0f
-
-// SET VALUES
-
-float p_in = 0.0f;
-float v_in = 3.0f;
-float kp_in = 0.0f;
-float kd_in = 3.0f;
-float t_in = 0.0f;
-//measured values
-
-float p_out = 0.0f;
-float v_out = 0.0f;
-float t_out = 0.0f;
-
-//the cs pin of the version after v1.1 is default to D9
-//v0.9 and v1.0 is default D10
-const int SPI_CS_PIN = 10;
-
-const unsigned long MOTOR_ID = 0x68;
-
-MCP_CAN CAN (SPI_CS_PIN);   //Set CS pin
+const uint32_t EXT_ID = 0x868;   // MIT mode (8) + motor ID 0x68
 
 void setup() {
   Serial.begin(500000);
   delay(1000);
-  while (CAN_OK != CAN.begin(MCP_ANY,CAN_500KBPS, MCP_16MHZ))
-  {
-    Serial.println("CAN BUS Shield init fail");
-    Serial.println(" Init CAN BUS Shield again");
-    delay(100);
+
+  while (CAN_OK != CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ)) {
+    Serial.println("CAN init fail");
+    delay(200);
   }
-Serial.println("CAN BUS Shield is ok!");
 
-//Intialize pins as necessary
-
-pinMode(UP, INPUT);
-pinMode(DOWN, INPUT);
-pinMode(LEFT, INPUT);
-pinMode(RIGHT, INPUT);
-pinMode(CLICK, INPUT);
-pinMode(LED2, OUTPUT);
-pinMode(LED3, OUTPUT);
-
-//Pull analog pins high to enable reading of joystick movements
-digitalWrite(UP, HIGH);
-digitalWrite(DOWN, HIGH);
-digitalWrite(LEFT, HIGH);
-digitalWrite(RIGHT, HIGH);
-digitalWrite(CLICK, HIGH);
-
-//Write LED pins low to trun them off by default
-
-digitalWrite(LED2, LOW);
-digitalWrite(LED3, LOW);
-
+  CAN.setMode(MCP_NORMAL);
+  Serial.println("CAN init ok");
 }
-
-long previousMillis = 0;
 
 void loop() {
-  static bool started = false;
+  // Exact packet from manual:
+  // 00000868 0006667FFF8F57FF
+  byte buf[8] = {0x00, 0x06, 0x66, 0x7F, 0xFF, 0x8F, 0x57, 0xFF};
 
-  if (!started) {
-    EnterMotorMode();
-    delay(10);
-    Zero();              // optional but helpful
-    delay(1000);
-     kp_in = 200.0f;
-    kd_in = 3.0f;
-    v_in  = 0.0f;
-    t_in  = 0.0f;
-    p_in  = 6.283185f;      // one full revolution = 2*pi radians
+  byte s = CAN.sendMsgBuf(EXT_ID, 1, 8, buf);
 
-    started = true;
-  }
-         // target position
-  pack_cmd();
+  Serial.print("send status = ");
+  Serial.println(s);
 
-  if (CAN_MSGAVAIL == CAN.checkReceive()) {
-    unpack_reply();
-    Serial.print("p_out: ");
-    Serial.print(p_out);
-    Serial.print("  v_out: ");
-    Serial.print(v_out);
-    Serial.print("  t_out: ");
-    Serial.println(t_out);
-  } else {
-    Serial.println("No reply");
-  }
-
-  delay(20);
-}
-void unpack_reply() {
-/// CAB reply Oacjet structure///
-/// 16 bit position, between -4*pi and 4*pi
-/// 12 bit velocity, between -30 and +30 rad/s
-/// 12 bit current, between -40 and 40;
-/// CAN Packet is 5 8-bit words
-///Formatted as follows. For each quantity, bit 0 is LSB
-/// 0: [position [15-8]]
-/// 1: [position[7-0]]
-/// 2: [velocity [11-4]]
-/// 3: [velocity [3-0], current [11-8]]
-/// 4: [current [7-0]]
-
-  byte len = 0;
-  byte buf[8];
-  unsigned long canId;
-
-  CAN.readMsgBuf(&canId, &len, buf); 
-
-  Serial.print("ID: ");
-  Serial.print(canId, HEX);
-  Serial.print("  RAW: ");
-  for (int i = 0; i < len; i++) {
+  Serial.print("TX: ");
+  for (int i = 0; i < 8; i++) {
     if (buf[i] < 16) Serial.print("0");
     Serial.print(buf[i], HEX);
     Serial.print(" ");
   }
   Serial.println();
-  //read data
-  //MCP_CAN::readMsgBuf(*len,  buf[])
 
-  
-  /// unpack ints from CAN buffer ///
-  unsigned int id = buf[0];
-  unsigned int p_int = (buf[1] << 8) | buf[2];
-  unsigned int v_int = (buf[3] << 4) | (buf[4] >> 4);
-  unsigned int i_int = ((buf[4] & 0xF) << 8) | buf[5];
-  /// convert uints to floats ///
-  p_out = uint_to_float(p_int, P_MIN, P_MAX, 16);
-  v_out = uint_to_float(v_int, V_MIN, V_MAX, 12);
-  t_out = uint_to_float(i_int, -T_MAX, T_MAX, 12);
-}
-void EnterMotorMode(){
-  //Enter Motor Mode(enable)
-  byte buf[8];
-  buf[0] = 0xFF;
-  buf[1] = 0xFF;
-  buf[2] = 0xFF;
-  buf[3] = 0xFF;
-  buf[4] = 0xFF;
-  buf[5] = 0xFF;
-  buf[6] = 0xFF;
-  buf[7] = 0xFC;
-  CAN.sendMsgBuf(MOTOR_ID,0, 8, buf);
-}
-void ExitMotorMode(){
-  byte buf[8];
-  buf[0] = 0xFF;
-  buf[1] = 0xFF;
-  buf[2] = 0xFF;
-  buf[3] = 0xFF;
-  buf[4] = 0xFF;
-  buf[5] = 0xFF;
-  buf[6] = 0xFF;
-  buf[7] = 0xFD;
-  CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
-}
-void Zero(){
-  //Enter Motor Mode(enable)
-  byte buf[8];
-  buf[0] = 0xFF;
-  buf[1] = 0xFF;
-  buf[2] = 0xFF;
-  buf[3] = 0xFF;
-  buf[4] = 0xFF;
-  buf[5] = 0xFF;
-  buf[6] = 0xFF;
-  buf[7] = 0xFE;
-  CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
+  if (CAN_MSGAVAIL == CAN.checkReceive()) {
+    unsigned long rxId;
+    byte len = 0;
+    byte rbuf[8];
+    CAN.readMsgBuf(&rxId, &len, rbuf);
 
-}
-void pack_cmd(){
-  byte buf[8];
-  ///CAN Command Packet Structure///
-  ///16 bit position command, between -4*pi and 4*pi
-  ///12 bit velocity command, between -30 and +30rad/s
-  //12 bit kp, between 0 and 500 N-m/rad
-  ///12 bit kd, between 0 and 100 N-m*s/rad
-  /// 12 bit feed forward toque, between -18 and 18 N-m
-  ///CAN packet is 8 8-bit words
-  ///Formatted as follows. For each quantity, bit i0 is LSB
-  /// 0: [position[15-8[[
-  ///1: [position [7-0]]
-  ///2: [velocity[11-4]]
-  ///3: [velocity[3-0], kp[11-8]]
-  ///4: [kp[7-0]]
-  ///5: [kd[11-4]]
-  ///6:[kd[3-0], torque [11-8]]
-  ///7: [torque [7-0]]
+    Serial.print("RX ID: 0x");
+    Serial.println(rxId, HEX);
 
-  ///limit data to be withing bounds///
-
-  float p_des = constrain(p_in, P_MIN, P_MAX); ///fminf(fmaxf(P_MIN, p_in(, P_MAX);
-  float v_des = constrain(v_in, V_MIN, V_MAX); ///fminf(fmaxf(V_MIN, v_in(, V_MAX);
-  float kp = constrain(kp_in, KP_MIN, KP_MAX); ///fminf(fmaxf(KP_MIN, kp_in(, KP_MAX);
-  float kd = constrain(kd_in, KD_MIN, KD_MAX); ///fminf(fmaxf(KD_MIN, kd_in(, KD_MAX);
-  float t_ff = constrain(t_in, T_MIN, T_MAX); ///fminf(fmaxf(T_MIN, t_in(, V_MAX);
-
- ///convert floats to unsigned ints///
-  unsigned int p_int = float_to_uint(p_des, P_MIN, P_MAX, 16);
-  unsigned int v_int = float_to_uint(v_des, V_MIN, V_MAX, 12);
-  unsigned int kp_int = float_to_uint(kp, KP_MIN, KP_MAX, 12);
-  unsigned int kd_int = float_to_uint(kd, KD_MIN, KD_MAX, 12);
-  unsigned int t_int = float_to_uint(t_ff, T_MIN, T_MAX, 12);
-
-/// pack ints into the can buffer///
-
-  buf[0] = p_int >> 8;
-  buf[1] = p_int & 0xFF;;
-  buf[2] = v_int >> 4;
-  buf[3] = ((v_int & 0xF) <<4) | (kp_int >>8);
-  buf[4] = kp_int & 0xFF;
-  buf[5] = kd_int >>4;
-  buf[6] = ((kd_int & 0xF) <<4) | (t_int >>8);
-  buf[7] = t_int & 0xFF;
-  byte s = CAN.sendMsgBuf(MOTOR_ID, 0, 8, buf);
-  Serial.print("send=");
-  Serial.println(s);
-}
-
-
-unsigned int float_to_uint(float x, float x_min, float x_max, int bits)
-{
-  ///Converts a  float to an unsigned int, given range and number of bits///
-  float span = x_max-x_min;
-  float offset = x_min;
-  unsigned int pgg = 0;
-  if(bits==12){
-    pgg = (unsigned int) ((x-offset)*4095.0/span);
+    Serial.print("RX DATA: ");
+    for (int i = 0; i < len; i++) {
+      if (rbuf[i] < 16) Serial.print("0");
+      Serial.print(rbuf[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  } else {
+    Serial.println("No reply");
   }
-  if(bits==16){
-    pgg = (unsigned int) ((x-offset)*65535.0/span);
-  }
-  return pgg;
-}
 
-float uint_to_float(unsigned int x_int, float x_min, float x_max, int bits)
-{
-  ///converts unsigned int to float, given range and number of bits///
-  float span = x_max-x_min;
-  float offset = x_min;
-  float pgg = 0;
-  if (bits==12){
-    pgg = ((float) x_int)*span/4095 + offset;
-  }
-  if (bits==16){
-    pgg = ((float) x_int)*span/65535.0 + offset;
-  }
-  return pgg;
-
+  delay(200);
 }
